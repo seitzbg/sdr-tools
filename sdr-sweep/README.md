@@ -188,6 +188,10 @@ sweep.
   throughput collapses. Some hosts' xHCI controllers can wedge on hotplug and
   need a cold power drain, not a warm reboot.
 
+## Author
+
+Developed by **Bryan Seitz**, with assistance from AI.
+
 ## License
 
 [MIT](LICENSE) © 2026 Bryan Seitz.

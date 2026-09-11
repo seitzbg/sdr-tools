@@ -35,6 +35,10 @@ See each tool's own README for its full install steps, system dependencies, and
 usage. (`sdr-sweep`, for example, needs a system UHD install for the two capture
 commands — that's not a PyPI dependency.)
 
+## Author
+
+Developed by **Bryan Seitz**, with assistance from AI.
+
 ## License
 
 [MIT](LICENSE) © 2026 Bryan Seitz.
