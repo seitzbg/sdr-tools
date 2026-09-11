@@ -6,6 +6,15 @@ dependencies, independently runnable and (where it's a Python package)
 independently `pip`-installable. New tools get added as their own subdir; there
 is no shared runtime to buy into.
 
+Where a tool produces metrics it ships the whole observability path with it: a
+**Prometheus exporter**, an example scrape job + systemd unit, and an importable
+**Grafana dashboard** — nothing external to wire up.
+
+![sdr-sweep's Grafana dashboard — B210 spectrum sweep](sdr-sweep/docs/images/dashboard.png)
+
+*Above: `sdr-sweep`'s Grafana dashboard — noise-floor drift, per-band occupancy,
+ADC-clip health, and B210 instrument telemetry, all fed by `sdr-sweep-exporter`.*
+
 ## Tools
 
 | Tool | What it does | Hardware |
