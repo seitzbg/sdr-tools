@@ -1,0 +1,28 @@
+# Example systemd unit: park on a band and serve Prometheus metrics forever.
+#
+# Runs the capture engine streaming JSON into the exporter. --exit-on-eof plus
+# Restart=always means a wedged or crashed capture tears the whole pipeline down
+# and brings it straight back, instead of serving stale metrics.
+#
+# Adjust the band, User, and paths for your host. The `uhd` module must be
+# importable by the Python that runs sdr-sweep (a system UHD install), and for a
+# USRP B210 the FPGA image must be loaded first (`uhd_usrp_probe`).
+#
+# Install:  cp examples/sdr-sweep-exporter.service /etc/systemd/system/
+#           systemctl daemon-reload && systemctl enable --now sdr-sweep-exporter
+
+[Unit]
+Description=SDR sweep -> Prometheus exporter (parked band)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Use the interpreter/venv that has both sdr-sweep and the system `uhd` module.
+ExecStart=/bin/sh -c '/usr/local/bin/sdr-sweep --start 902M --stop 928M --stream --quiet | /usr/local/bin/sdr-sweep-exporter --port 9821 --bands 8 --exit-on-eof'
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

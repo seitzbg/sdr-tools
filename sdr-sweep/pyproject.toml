@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sdr-sweep"
+version = "1.0.0"
+description = "Wideband spectrum sweep, live TUI, Prometheus exporter, and Grafana dashboard for the USRP B210 (UHD)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Bryan Seitz" }]
+keywords = ["sdr", "usrp", "b210", "uhd", "spectrum", "rf", "prometheus", "grafana", "waterfall"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Ham Radio",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Monitoring",
+]
+dependencies = ["numpy>=1.24"]
+
+# UHD (the `uhd` Python module) is a SYSTEM dependency, not a PyPI package.
+# Only the capture commands (sdr-sweep, sdr-sweep-gaincal) need it; install it
+# from your platform's UHD packages. See the README > Install.
+[project.optional-dependencies]
+analysis = ["matplotlib>=3.7"]  # sdr-sweep-report waterfall PNG
+tui = ["rich>=13.0"]            # sdr-sweep-tui live display
+all = ["matplotlib>=3.7", "rich>=13.0"]
+
+[project.scripts]
+sdr-sweep = "sdr_sweep.sweep:main"
+sdr-sweep-exporter = "sdr_sweep.exporter:main"
+sdr-sweep-report = "sdr_sweep.report:main"
+sdr-sweep-tui = "sdr_sweep.tui:main"
+sdr-sweep-gaincal = "sdr_sweep.gaincal:main"
+
+[project.urls]
+Homepage = "https://github.com/seitzbg/sdr-tools/tree/main/sdr-sweep"
+Repository = "https://github.com/seitzbg/sdr-tools"
+Issues = "https://github.com/seitzbg/sdr-tools/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sdr_sweep"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/dashboards", "/examples", "/docs", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+# Real bugs (F) and syntax/logic errors (E9), plus the pycodestyle error
+# subsets. The capture code is kept faithful to its proven original, so the
+# more opinionated stylistic rulesets are intentionally not enforced.
+select = ["E4", "E7", "E9", "F"]

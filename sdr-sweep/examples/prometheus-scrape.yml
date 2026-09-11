@@ -1,0 +1,15 @@
+# Example Prometheus scrape config for the sdr-sweep exporter.
+#
+# Merge this job into your prometheus.yml scrape_configs. The exporter serves
+# text metrics on :9821/metrics. A 30s interval works well with the exporter's
+# default 60s rolling window (--window should be >= 2x the scrape interval).
+
+scrape_configs:
+  - job_name: sdr_sweep
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["sdr-host.example.net:9821"]
+        labels:
+          # Optional: a `host` label lets the dashboard's $host variable filter
+          # the node_exporter hwmon panels to this machine.
+          host: sdr-host
