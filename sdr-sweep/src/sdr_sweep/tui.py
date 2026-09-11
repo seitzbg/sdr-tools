@@ -12,7 +12,6 @@ straight off the radio over SSH:
 Shows a running spectrum (peak-hold), a scrolling colour waterfall, and live
 stats (noise floor, strongest signals, active-bin count). Ctrl-C to quit.
 """
-import json
 import shutil
 import sys
 from collections import deque
@@ -20,6 +19,7 @@ from collections import deque
 import numpy as np
 
 from sdr_sweep import __version__
+from sdr_sweep.record import parse_sweep
 
 BLOCKS = " ▁▂▃▄▅▆▇█"
 # Coarse viridis anchors (t: 0..1) for the waterfall colour ramp.
@@ -42,9 +42,19 @@ def color(t):
 
 
 def pool(db, w):
-    """Max-pool a full-res spectrum into w columns (max keeps narrow signals)."""
+    """Resample a full-res spectrum to exactly w columns.
+
+    Down-samples by max-pooling (max keeps a narrow signal visible); up-samples
+    a spectrum with fewer bins than columns by nearest-neighbour so the result
+    is ALWAYS length w. Returning the short input unchanged (the old behaviour)
+    let the render loop index past its end and crash on narrow captures.
+    """
+    db = np.asarray(db, dtype=float)
+    if len(db) == 0:
+        return np.zeros(w)
     if len(db) <= w:
-        return db
+        idx = np.minimum((np.arange(w) * len(db)) // w, len(db) - 1)
+        return db[idx]
     idx = np.linspace(0, len(db), w + 1).astype(int)
     return np.array([db[idx[i]:idx[i + 1]].max() for i in range(w)])
 
@@ -87,7 +97,10 @@ def main():
             peak_hold = pdb.copy()
             occ = pool(active.astype(float), cols)
         else:
-            peak_hold = np.maximum(peak_hold * 0.995, pdb)   # slow-decay peak hold
+            # Decay by SUBTRACTING dB, not multiplying: dB levels are negative,
+            # so peak_hold * 0.995 moves *up* toward 0 and the hold grows after a
+            # signal goes away instead of fading. Subtract a fixed dB per update.
+            peak_hold = np.maximum(peak_hold - 0.5, pdb)     # slow-decay peak hold
             occ = 0.95 * occ + 0.05 * pool(active.astype(float), cols)
 
         vmin = float(np.percentile(db, 20))
@@ -132,14 +145,10 @@ def main():
     with Live(console=console, screen=True, auto_refresh=False) as live:
         try:
             for line in sys.stdin:
-                line = line.strip()
-                if not line:
+                rec = parse_sweep(line)     # skips blank/malformed/empty-db lines
+                if rec is None:
                     continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                live.update(render(obj), refresh=True)
+                live.update(render(rec), refresh=True)
         except (KeyboardInterrupt, BrokenPipeError):
             pass
 

@@ -32,14 +32,13 @@ sdr-sweep-exporter for the measurement and restarts it afterwards, always).
 """
 import argparse
 import json
-import math
 import subprocess
 import sys
 import time
 
 import numpy as np
 
-from sdr_sweep import __version__
+from sdr_sweep import __version__, sweep
 
 SERVICE = "sdr-sweep-exporter"
 
@@ -67,16 +66,57 @@ def parse_hz(s):
     return float(s) * mult
 
 
-def next_pow2(x):
-    return 1 << (int(math.ceil(x)) - 1).bit_length()
-
-
 def clip_fraction(iq):
     """fc32 RX is scaled to ~[-1, 1]; |I| or |Q| at ~1.0 = ADC saturation."""
     return float(np.mean((np.abs(iq.real) >= 0.99) | (np.abs(iq.imag) >= 0.99)))
 
 
-def probe_clip(usrp, streamer, center, samp_rate, gain, dwell_s, chunk_s):
+def _burst_recv(streamer, recv_buf, md, nsamps, timeout, deadline):
+    """Bounded burst receive into a fresh IQ array; UHD-type-free (testable).
+
+    The caller has already issued the num_done stream command; this drains it
+    with an explicit deadline and per-recv timeout so a wedged receiver cannot
+    loop forever — the failure mode UHD's own recv_num_samps() convenience
+    method has, since it retries until its sample count is reached and a stream
+    of zero-sample timeouts never terminates it.
+    """
+    iq = np.empty(nsamps, dtype=np.complex64)
+    got = 0
+    while got < nsamps:
+        n = streamer.recv(recv_buf, md, timeout)
+        if not n:
+            raise RuntimeError(f"rx burst stalled at {got}/{nsamps} samples: {md.strerror()}")
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"rx burst exceeded its deadline at {got}/{nsamps} samples")
+        take = min(nsamps - got, n)
+        iq[got:got + take] = recv_buf[0, :take]
+        got += take
+    return iq
+
+
+def _burst(usrp, streamer, recv_buf, nsamps, samp_rate, timeout=0.5):
+    """Issue a num_done burst for exactly `nsamps` and drain it with a deadline."""
+    import uhd
+    cmd = uhd.types.StreamCMD(uhd.types.StreamMode.num_done)
+    cmd.num_samps = int(nsamps)
+    cmd.stream_now = True
+    streamer.issue_stream_cmd(cmd)
+    md = uhd.types.RXMetadata()
+    # Allow up to ~4x the burst's own duration plus a couple of recv timeouts
+    # before declaring it wedged — generous for retune/settling, bounded overall.
+    deadline = time.monotonic() + nsamps / samp_rate * 4.0 + 2.0 * timeout + 1.0
+    return _burst_recv(streamer, recv_buf, md, int(nsamps), timeout, deadline)
+
+
+def capture(usrp, streamer, recv_buf, center, gain, samp_rate, nsamps, timeout=0.5):
+    """Tune + set gain (stream stopped), then a single bounded num_done burst."""
+    import uhd
+    usrp.set_rx_freq(uhd.types.TuneRequest(center), 0)
+    usrp.set_rx_gain(gain, 0)
+    return _burst(usrp, streamer, recv_buf, nsamps, samp_rate, timeout)
+
+
+def probe_clip(usrp, streamer, recv_buf, center, samp_rate, gain, dwell_s, chunk_s):
     """Worst clip fraction over ~dwell_s of near-contiguous IQ at one center.
 
     Returns (worst_clip, rf_seconds_observed).
@@ -92,22 +132,22 @@ def probe_clip(usrp, streamer, center, samp_rate, gain, dwell_s, chunk_s):
     clean.
 
     Each chunk here is CONTIGUOUS, so a burst starting inside one is actually
-    caught, and we keep going until the dwell elapses. Chunks are bounded so
-    a long dwell does not allocate an enormous buffer.
+    caught, and we keep going until the dwell elapses. Each burst is deadline-
+    bounded (see _burst) so a stalled receiver aborts calibration loudly
+    instead of hanging with the monitoring service left stopped.
     """
     n_chunk = max(1024, int(samp_rate * chunk_s))
     deadline = time.monotonic() + dwell_s
     worst, rf = 0.0, 0.0
     while True:
-        samps = usrp.recv_num_samps(n_chunk, center, samp_rate, [0], gain, streamer=streamer)
-        iq = np.asarray(samps).reshape(-1)
+        iq = capture(usrp, streamer, recv_buf, center, gain, samp_rate, n_chunk)
         worst = max(worst, clip_fraction(iq))
         rf += len(iq) / samp_rate
         if time.monotonic() >= deadline:
             return worst, rf
 
 
-def measure(usrp, streamer, centers, samp_rate, nfft, keep, frames, window, wnorm, gain,
+def measure(usrp, streamer, recv_buf, centers, samp_rate, nfft, keep, frames, window, wnorm, gain,
             clip_dwell=0.0, clip_chunk_s=0.05):
     """Return (floor_db, clip_fraction, rf_seconds) for one gain.
 
@@ -123,8 +163,8 @@ def measure(usrp, streamer, centers, samp_rate, nfft, keep, frames, window, wnor
     rf_total = 0.0
     lo = (nfft - keep) // 2
     for c in centers:
-        samps = usrp.recv_num_samps((frames + 1) * nfft, c, samp_rate, [0], gain, streamer=streamer)
-        iq = np.asarray(samps).reshape(-1)[nfft:][: frames * nfft]
+        iq = capture(usrp, streamer, recv_buf, c, gain, samp_rate, (frames + 1) * nfft)
+        iq = iq[nfft:][: frames * nfft]
         clips.append(clip_fraction(iq))
         rf_total += len(iq) / samp_rate
         mat = iq.reshape(frames, nfft)
@@ -133,7 +173,7 @@ def measure(usrp, streamer, centers, samp_rate, nfft, keep, frames, window, wnor
         db = 10.0 * np.log10(power + 1e-20)
         floors.append(float(np.median(db[lo:lo + keep])))
         if clip_dwell > 0:
-            worst, rf = probe_clip(usrp, streamer, c, samp_rate, gain,
+            worst, rf = probe_clip(usrp, streamer, recv_buf, c, samp_rate, gain,
                                    clip_dwell, clip_chunk_s)
             clips.append(worst)
             rf_total += rf
@@ -146,6 +186,12 @@ def analyse(gains, floors, clips, clip_thresh, knee_slope, step):
     # Overload onset = lowest gain whose clip fraction exceeds the threshold.
     overload_idx = next((i for i, c in enumerate(clips) if c > clip_thresh), None)
     overload = gains[overload_idx] if overload_idx is not None else None
+    # If the LOWEST tested gain already clips there is no clean operating point
+    # at all: subtracting 10 dB and clamping back would "recommend" that same
+    # overloaded gain. Return an explicit no-recommendation instead of publishing
+    # a usable-looking number. The caller advises lower gain / more attenuation.
+    if overload_idx == 0:
+        return slopes, None, False, overload, None
     hi_idx = overload_idx if overload_idx is not None else len(gains)
 
     # Knee = lowest gain from which the floor tracks gain ~1:1 for the REST of
@@ -241,38 +287,64 @@ def main():
         if not a.json:
             print(*m, file=sys.stderr, flush=True)
 
-    managed = False
-    if a.manage_service:
-        subprocess.run(["systemctl", "stop", SERVICE], check=False)
-        managed = True
-        time.sleep(2)
-        note(f"[gaincal] paused {SERVICE}")
+    def warn(*m):
+        # Always visible, even with --json: a failed stop/restart means the
+        # monitoring service state is not what the caller assumes.
+        print(*m, file=sys.stderr, flush=True)
 
+    # Validate options and dependency availability BEFORE taking monitoring
+    # offline, so a bad argument or a missing UHD module never leaves the
+    # exporter stopped.
+    if a.gain_step <= 0:
+        ap.error("--gain-step must be > 0")
+    if a.gain_stop is not None and a.gain_stop <= a.gain_start:
+        ap.error("--gain-stop must be greater than --gain-start")
     try:
-        samp_rate = float(a.hop_bw)
-        nfft = int(next_pow2(samp_rate / a.bin))
-        bin_hz = samp_rate / nfft
-        keep = int(nfft * (1.0 - a.crop)) & ~1
-        usable = keep * bin_hz
-        span = a.stop - a.start
-        if span <= usable:
-            centers = [a.start + span / 2.0]
-        else:
-            n = int(math.ceil(span / usable))
-            centers = [a.start + usable * (i + 0.5) for i in range(n)]
-        window = np.hanning(nfft)
-        wnorm = (window ** 2).sum()
+        sweep.validate_scan(a.hop_bw, a.bin, a.crop, a.frames)
+    except ValueError as exc:
+        ap.error(str(exc))
+    uhd = _require_uhd()  # module import only; the device is opened after the stop
 
-        uhd = _require_uhd()
+    managed = False
+    try:
+        # Enter the try (so `finally` will always restart the service) BEFORE
+        # stopping it: a Ctrl-C during the stop or the settle sleep must still
+        # restore monitoring.
+        if a.manage_service:
+            managed = True
+            stop = subprocess.run(["systemctl", "stop", SERVICE])
+            if stop.returncode != 0:
+                warn(f"[gaincal] WARNING: 'systemctl stop {SERVICE}' returned "
+                     f"{stop.returncode}; it may still be holding the radio")
+            else:
+                note(f"[gaincal] paused {SERVICE}")
+            time.sleep(2)
+
+        samp_rate, nfft, bin_hz, keep, centers, usable = sweep.build_hop_plan(
+            a.start, a.stop, a.hop_bw, a.bin, a.crop)
+
         usrp = uhd.usrp.MultiUSRP()
         usrp.set_rx_antenna(a.ant, 0)
         usrp.set_rx_rate(samp_rate, 0)
+        # UHD may coerce the rate (get_rx_rate is the source of truth). Rebuild
+        # the plan on the actual rate so bin width, hop spacing and the reported
+        # RF seconds describe the spectrum actually sampled.
+        actual_rate = float(usrp.get_rx_rate(0))
+        if abs(actual_rate - samp_rate) > 1.0:
+            note(f"[gaincal] UHD coerced sample rate {samp_rate/1e6:.6f}M -> "
+                 f"{actual_rate/1e6:.6f}M; rebuilding the plan on the actual rate")
+            samp_rate, nfft, bin_hz, keep, centers, usable = sweep.build_hop_plan(
+                a.start, a.stop, actual_rate, a.bin, a.crop)
+        window = np.hanning(nfft)
+        wnorm = (window ** 2).sum()
+
         grange = usrp.get_rx_gain_range(0)
         gmax = a.gain_stop if a.gain_stop is not None else grange.stop()
         gmin = max(a.gain_start, grange.start())
         st = uhd.usrp.StreamArgs("fc32", "sc16")
         st.channels = [0]
         streamer = usrp.get_rx_stream(st)
+        recv_buf = np.zeros((1, streamer.get_max_num_samps()), dtype=np.complex64)
 
         gains = list(np.arange(gmin, gmax + 0.1, a.gain_step))
         note(f"[gaincal] {a.start/1e6:.0f}-{a.stop/1e6:.0f} MHz  ant={a.ant}  "
@@ -282,8 +354,8 @@ def main():
                  "(~230 us/hop). A clip of 0 means 'not seen', NOT 'not clipping'.")
         floors, clips, rfsecs = [], [], []
         for g in gains:
-            f, c, rf = measure(usrp, streamer, centers, samp_rate, nfft, keep, a.frames,
-                               window, wnorm, g, a.clip_dwell, a.clip_chunk_ms / 1000.0)
+            f, c, rf = measure(usrp, streamer, recv_buf, centers, samp_rate, nfft, keep,
+                               a.frames, window, wnorm, g, a.clip_dwell, a.clip_chunk_ms / 1000.0)
             floors.append(f)
             clips.append(c)
             rfsecs.append(rf)
@@ -295,12 +367,19 @@ def main():
             gains, floors, clips, a.clip_thresh, a.knee_slope, a.gain_step)
     finally:
         if managed:
-            subprocess.run(["systemctl", "start", SERVICE], check=False)
-            note(f"[gaincal] restarted {SERVICE}")
+            start = subprocess.run(["systemctl", "start", SERVICE])
+            if start.returncode != 0:
+                warn(f"[gaincal] WARNING: failed to restart {SERVICE} (rc={start.returncode}) — "
+                     f"monitoring may be DOWN; run 'systemctl start {SERVICE}'")
+            else:
+                note(f"[gaincal] restarted {SERVICE}")
 
     if a.json:
         print(json.dumps({
             "recommended": rec, "knee": knee, "knee_reached": knee_reached,
+            # False when every tested gain clips: `recommended` is null and the
+            # caller should lower gain or add attenuation. See analyse().
+            "clean_gain_exists": rec is not None,
             "overload_onset": overload,
             "gain_min": gmin, "gain_max": gmax,
             # How much RF was actually inspected. A clip_frac of 0 is only ever
@@ -329,7 +408,11 @@ def main():
     else:
         print(f"  overload onset   : none seen in {rf_total:.1f}s of RF "
               f"(NOT proof of none — see the caveat below)")
-    if knee_reached:
+    if rec is None:
+        print(f"  >> recommended    : NONE — the lowest tested gain ({gmin:.0f} dB) already "
+              f"clips.\n     No clean operating point exists in this range. Lower --gain-start, "
+              f"add\n     external attenuation, or reduce the input signal, then re-run.")
+    elif knee_reached:
         print(f"  >> recommended    : {rec} dB  (lower third of the clean range: "
               f"full sensitivity + maximum clip headroom)")
     else:
@@ -354,8 +437,9 @@ def main():
               f"{100.0 * min(per_gain / 60.0, 1.0):.0f}% for a once-a-minute burst.")
         print("  Raise --clip-dwell for a rarer emitter, or just trust the exporter's")
         print("  continuous sdr_sweep_clip_fraction_max — it watches every sweep, forever.")
-    print(f"\n  To apply: set  sweep_gain: \"{rec}\"  in munro/ansible "
-          f"playbooks/sdr1-sweep-exporter.yml and re-run it.")
+    if rec is not None:
+        print(f"\n  To apply: set  sweep_gain: \"{rec}\"  in munro/ansible "
+              f"playbooks/sdr1-sweep-exporter.yml and re-run it.")
 
 
 if __name__ == "__main__":
