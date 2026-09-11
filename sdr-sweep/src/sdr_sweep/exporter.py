@@ -28,7 +28,6 @@ curling /metrics by hand while Prometheus is also scraping, changes nothing.
 """
 import argparse
 import collections
-import json
 import statistics
 import sys
 import threading
@@ -36,6 +35,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from sdr_sweep import __version__
+from sdr_sweep.record import parse_sweep, validate_sweep
 
 _LOCK = threading.Lock()
 _STATE = {"have": False}
@@ -49,9 +49,10 @@ _SWEEPS = collections.deque(maxlen=100_000)
 
 
 def update(obj):
-    db = obj["db"]
-    if not db:
+    obj = validate_sweep(obj)     # tolerate any malformed record shape (skip it)
+    if obj is None:
         return
+    db = obj["db"]
     f0, f1, binhz = obj["f0"], obj["f1"], obj["bin"]
     floor = statistics.median(db)
     thr = floor + _MARGIN
@@ -70,15 +71,22 @@ def update(obj):
                 continue
             blo = f0 + lo * binhz
             bhi = f0 + hi * binhz
-            bthr = statistics.median(seg) + _MARGIN
             bands.append({
-                "label": f"{blo/1e6:.1f}-{bhi/1e6:.1f}MHz",
+                # `idx` makes every band a distinct Prometheus series even when a
+                # narrow capture rounds two bands' frequency text to the same
+                # string; the frequency `label` stays for display. 3 decimals
+                # (kHz) also keeps sub-MHz bands legible.
+                "idx": b,
+                "label": f"{blo/1e6:.3f}-{bhi/1e6:.3f}MHz",
                 "peak": max(seg),
-                "occ": sum(1 for v in seg if v > bthr) / len(seg),
+                "occ": sum(1 for v in seg if v > statistics.median(seg) + _MARGIN) / len(seg),
             })
 
     summary = {
         "floor": floor, "peak": peak, "peak_f": peak_f,
+        # SNR is per-sweep: this sweep's peak minus this sweep's own floor, so a
+        # window aggregate of it never pairs one sweep's peak with another's floor.
+        "snr": peak - floor,
         "active": active, "total": len(db), "occ": active / len(db),
         "clip": float(obj.get("clip", 0.0)), "bands": bands,
     }
@@ -121,6 +129,7 @@ def render_metrics():
     g("sdr_sweep_noise_floor_db", "Median noise floor of latest sweep (uncal dB)", f"{s['floor']:.3f}")
     g("sdr_sweep_peak_db", "Strongest bin of latest sweep (uncal dB)", f"{s['peak']:.3f}")
     g("sdr_sweep_peak_freq_hz", "Frequency of the strongest bin (Hz)", f"{s['peak_f']:.0f}")
+    g("sdr_sweep_snr_db", "Peak-minus-floor of the latest sweep (uncal dB)", f"{s['snr']:.3f}")
     g("sdr_sweep_active_bins", f"Bins above floor+{_MARGIN:.0f}dB in latest sweep", s["active"])
     g("sdr_sweep_total_bins", "Total bins in latest sweep", s["total"])
     g("sdr_sweep_occupancy_ratio", "active/total bins in latest sweep", f"{s['occ']:.4f}")
@@ -135,11 +144,11 @@ def render_metrics():
         out.append("# HELP sdr_sweep_band_peak_db Peak level per sub-band (uncal dB)")
         out.append("# TYPE sdr_sweep_band_peak_db gauge")
         for b in s["bands"]:
-            out.append(f'sdr_sweep_band_peak_db{{band="{b["label"]}"}} {b["peak"]:.3f}')
+            out.append(f'sdr_sweep_band_peak_db{{band="{b["label"]}",idx="{b["idx"]}"}} {b["peak"]:.3f}')
         out.append("# HELP sdr_sweep_band_occupancy_ratio Occupancy per sub-band")
         out.append("# TYPE sdr_sweep_band_occupancy_ratio gauge")
         for b in s["bands"]:
-            out.append(f'sdr_sweep_band_occupancy_ratio{{band="{b["label"]}"}} {b["occ"]:.4f}')
+            out.append(f'sdr_sweep_band_occupancy_ratio{{band="{b["label"]}",idx="{b["idx"]}"}} {b["occ"]:.4f}')
 
     # --- rolling-window aggregates -------------------------------------------
     # Every sweep in the window contributes, so short bursts and ADC overloads
@@ -171,28 +180,35 @@ def render_metrics():
           f"{max(clips):.6f}")
         g("sdr_sweep_clip_fraction_mean", f"Mean ADC clip fraction over {_WINDOW:.0f}s (0..1)",
           f"{statistics.fmean(clips):.6f}")
+        # SNR aggregated as a per-sweep quantity (peak minus that same sweep's
+        # floor), so it never subtracts one sweep's floor from another's peak the
+        # way `peak_db_max - noise_floor_db_mean` would across the window.
+        g("sdr_sweep_snr_db_max", f"Best single-sweep peak-minus-floor over {_WINDOW:.0f}s (uncal dB)",
+          f"{max(w['snr'] for w in win):.3f}")
 
-        # Per-band, grouped by label. Bands are generated in ascending frequency
-        # order every sweep, so first-seen insertion order is frequency order.
+        # Per-band, grouped by index (a stable, unique identity even when two
+        # bands' frequency labels collide). Bands are generated in ascending
+        # frequency order every sweep, so index order is frequency order.
         agg = {}
         for w in win:
             for b in w["bands"]:
-                slot = agg.setdefault(b["label"], {"peak": [], "occ": []})
+                slot = agg.setdefault(b["idx"], {"label": b["label"], "peak": [], "occ": []})
                 slot["peak"].append(b["peak"])
                 slot["occ"].append(b["occ"])
         if agg:
+            ordered = sorted(agg.items())
             out.append(f"# HELP sdr_sweep_band_peak_db_max Peak level per sub-band over {_WINDOW:.0f}s (uncal dB)")
             out.append("# TYPE sdr_sweep_band_peak_db_max gauge")
-            for label, v in agg.items():
-                out.append(f'sdr_sweep_band_peak_db_max{{band="{label}"}} {max(v["peak"]):.3f}')
+            for idx, v in ordered:
+                out.append(f'sdr_sweep_band_peak_db_max{{band="{v["label"]}",idx="{idx}"}} {max(v["peak"]):.3f}')
             out.append(f"# HELP sdr_sweep_band_occupancy_ratio_max Highest per-sub-band occupancy over {_WINDOW:.0f}s")
             out.append("# TYPE sdr_sweep_band_occupancy_ratio_max gauge")
-            for label, v in agg.items():
-                out.append(f'sdr_sweep_band_occupancy_ratio_max{{band="{label}"}} {max(v["occ"]):.4f}')
+            for idx, v in ordered:
+                out.append(f'sdr_sweep_band_occupancy_ratio_max{{band="{v["label"]}",idx="{idx}"}} {max(v["occ"]):.4f}')
             out.append(f"# HELP sdr_sweep_band_occupancy_ratio_mean Mean per-sub-band occupancy over {_WINDOW:.0f}s")
             out.append("# TYPE sdr_sweep_band_occupancy_ratio_mean gauge")
-            for label, v in agg.items():
-                out.append(f'sdr_sweep_band_occupancy_ratio_mean{{band="{label}"}} {statistics.fmean(v["occ"]):.4f}')
+            for idx, v in ordered:
+                out.append(f'sdr_sweep_band_occupancy_ratio_mean{{band="{v["label"]}",idx="{idx}"}} {statistics.fmean(v["occ"]):.4f}')
     return "\n".join(out) + "\n"
 
 
@@ -218,14 +234,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def read_stdin():
+    skipped = 0
     for line in sys.stdin:
-        line = line.strip()
-        if not line:
+        rec = parse_sweep(line)
+        if rec is None:
+            if line.strip():
+                skipped += 1
+                # A bad line in a replay or a composed stream must not stop the
+                # consumer; note the first few (and every 1000th) and carry on.
+                if skipped <= 5 or skipped % 1000 == 0:
+                    print(f"[exporter] skipped malformed record #{skipped}",
+                          file=sys.stderr, flush=True)
             continue
-        try:
-            update(json.loads(line))
-        except (json.JSONDecodeError, KeyError, ValueError):
-            continue
+        update(rec)
 
 
 def main():

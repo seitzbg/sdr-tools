@@ -31,6 +31,19 @@ jobs:
       - name: Build sdist + wheel
         working-directory: ${{ matrix.tool }}
         run: python -m build
-      # Note: no hardware-in-the-loop tests. The capture path needs a USRP B210
-      # and the system `uhd` module (not on PyPI), so CI only lints, compiles,
-      # and builds the distribution.
+      - name: Install the built wheel
+        working-directory: ${{ matrix.tool }}
+        run: python -m pip install "$(ls dist/*.whl)" pytest
+      - name: Run tests
+        working-directory: ${{ matrix.tool }}
+        run: python -m pytest -q
+      - name: CLI smoke (--help / --version)
+        working-directory: ${{ matrix.tool }}
+        run: |
+          for cmd in sdr-sweep sdr-sweep-exporter sdr-sweep-report sdr-sweep-tui sdr-sweep-gaincal; do
+            "$cmd" --version
+            "$cmd" --help > /dev/null
+          done
+      # The behaviour tests are host-only: the capture path needs a USRP B210 and
+      # the system `uhd` module (not on PyPI), so the radio itself is exercised by
+      # a fake streamer in the tests, never real hardware in CI.

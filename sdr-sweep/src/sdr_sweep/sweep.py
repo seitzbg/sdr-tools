@@ -66,28 +66,120 @@ def next_pow2(x):
     return 1 << (int(math.ceil(x)) - 1).bit_length()
 
 
-def build_plan(args):
-    """Turn the requested range into a concrete hop plan.
+def validate_scan(hop_bw, bin_hz, crop, frames):
+    """Raise ValueError if the core scan parameters can't form a usable plan.
 
-    Returns (samp_rate, nfft, bin_hz, keep, centers, usable_bw). If the whole
-    range fits in one hop bandwidth we park on a single center (fast cadence);
-    otherwise we tile the range with contiguous cropped hops.
+    Guards the degenerate inputs that otherwise surface as a ZeroDivisionError
+    deep in build_hop_plan (bin/hop-bw = 0, crop = 1) or as an empty/1-bin FFT
+    with no DC neighbours. Shared by the capture and calibration front-ends.
     """
-    span = args.stop - args.start
-    samp_rate = float(args.hop_bw)
-    nfft = int(next_pow2(samp_rate / args.bin))
-    bin_hz = samp_rate / nfft
+    if not (math.isfinite(hop_bw) and hop_bw > 0):
+        raise ValueError("hop-bw must be a positive, finite frequency")
+    if not (math.isfinite(bin_hz) and bin_hz > 0):
+        raise ValueError("bin must be a positive, finite frequency")
+    if not (math.isfinite(crop) and 0.0 <= crop < 1.0):
+        raise ValueError("crop must be in [0, 1)")
+    if not (isinstance(frames, int) and frames >= 1):
+        raise ValueError("frames must be an integer >= 1")
+    nfft = int(next_pow2(hop_bw / bin_hz))
+    if nfft < 4:
+        raise ValueError("bin is too large relative to hop-bw (need >= 4 FFT bins)")
+    keep = int(nfft * (1.0 - crop)) & ~1
+    if keep < 2:
+        raise ValueError("crop leaves fewer than 2 usable bins per hop; lower --crop")
+
+
+def build_hop_plan(start, stop, hop_bw, bin_hz, crop):
+    """Turn a requested range into a concrete hop plan.
+
+    Returns (samp_rate, nfft, bin_res, keep, centers, usable_bw). If the whole
+    range fits in one hop bandwidth we park on a single center (fast cadence);
+    otherwise we tile the range with contiguous cropped hops. `bin_res` is the
+    achieved FFT bin width (samp_rate / nfft), which is what the metadata and
+    frequency grids must be derived from — see hop_bin_centers.
+    """
+    span = stop - start
+    samp_rate = float(hop_bw)
+    nfft = int(next_pow2(samp_rate / bin_hz))
+    bin_res = samp_rate / nfft
     # Keep the central (1-crop) fraction of bins; the rest is analog/decimation
     # filter roll-off. Make it even so it's symmetric about DC.
-    keep = int(nfft * (1.0 - args.crop)) & ~1
-    usable_bw = keep * bin_hz
+    keep = int(nfft * (1.0 - crop)) & ~1
+    usable_bw = keep * bin_res
 
     if span <= usable_bw:
-        centers = [args.start + span / 2.0]
+        centers = [start + span / 2.0]
     else:
         n_hops = int(math.ceil(span / usable_bw))
-        centers = [args.start + usable_bw * (i + 0.5) for i in range(n_hops)]
-    return samp_rate, nfft, bin_hz, keep, centers, usable_bw
+        centers = [start + usable_bw * (i + 0.5) for i in range(n_hops)]
+    return samp_rate, nfft, bin_res, keep, centers, usable_bw
+
+
+def build_plan(args):
+    """Back-compatible wrapper: build the hop plan from a parsed-args namespace."""
+    return build_hop_plan(args.start, args.stop, args.hop_bw, args.bin, args.crop)
+
+
+def hop_bin_centers(center, keep, bin_hz):
+    """Centre frequency of each kept bin of a hop, on the true FFT grid.
+
+    An even-length FFT after fftshift places bin k at ``center + (k - nfft/2) *
+    bin_hz``; the ``keep`` central bins (symmetric crop) therefore sit at
+    ``center + (j - keep/2) * bin_hz`` for j in [0, keep). No half-bin fudge.
+    """
+    return center + (np.arange(keep) - keep / 2.0) * bin_hz
+
+
+def sweep_schedule(clk, count, duration, interval, stop=lambda: False):
+    """Yield a sweep index each time a sweep should start; own the run's timing.
+
+    Uses a monotonic run deadline (immune to wall-clock steps), checks it
+    *before* starting each sweep, and bounds the inter-sweep wait by the time
+    left in the run — so a short --duration with a long --interval can never
+    wait a whole interval and then run one more sweep past the deadline.
+
+    `clk` supplies .monotonic() and .sleep(); `stop()` is polled so Ctrl-C
+    breaks the wait promptly.
+    """
+    start = clk.monotonic()
+    deadline = (start + duration) if duration else None
+    n = 0
+    while not stop():
+        if deadline is not None and clk.monotonic() >= deadline:
+            return
+        sweep_start = clk.monotonic()
+        yield n
+        n += 1
+        if count and n >= count:
+            return
+        if deadline is not None and clk.monotonic() >= deadline:
+            return
+        if interval:
+            target = sweep_start + interval
+            if deadline is not None:
+                target = min(target, deadline)
+            while not stop():
+                remaining = target - clk.monotonic()
+                if remaining <= 0:
+                    break
+                clk.sleep(min(0.2, remaining))
+
+
+def bins_in_range(centers, keep, bin_hz, start, stop):
+    """How many kept bins across all hops fall within [start, stop] (inclusive)."""
+    allc = np.concatenate([hop_bin_centers(c, keep, bin_hz) for c in centers])
+    return int(((allc >= start) & (allc <= stop)).sum())
+
+
+def csv_timestamp(epoch):
+    """rtl_power-style (date, time) split, but with sub-second precision.
+
+    The engine can run many sweeps per second, so whole-second timestamps
+    collapse a fast run to zero duration. Microseconds are appended to the time
+    field; report.load parses both this and legacy whole-second logs.
+    """
+    d, t = time.strftime("%Y-%m-%d, %H:%M:%S", time.localtime(epoch)).split(", ")
+    return d, f"{t}.{int(round((epoch % 1.0) * 1e6)):06d}"
 
 
 def hop_psd(usrp, streamer, recv_buf, center, nfft, frames, window, wnorm):
@@ -167,8 +259,17 @@ def main():
 
     if args.stop <= args.start:
         ap.error("--stop must be greater than --start")
+    try:
+        validate_scan(args.hop_bw, args.bin, args.crop, args.frames)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     samp_rate, nfft, bin_hz, keep, centers, usable_bw = build_plan(args)
+    # A range narrower than a single bin selects no output bins (later the
+    # empty [start,stop] mask indexes freqs[m][0] and crashes). Catch it here.
+    if bins_in_range(centers, keep, bin_hz, args.start, args.stop) == 0:
+        ap.error(f"no FFT bin falls within {args.start/1e6:.6f}-{args.stop/1e6:.6f} MHz; "
+                 f"the span is narrower than one {bin_hz:.0f} Hz bin — use a smaller --bin")
     window = np.hanning(nfft)
     wnorm = (window ** 2).sum()
 
@@ -184,6 +285,23 @@ def main():
     usrp = uhd.usrp.MultiUSRP()
     usrp.set_rx_antenna(args.ant, 0)
     usrp.set_rx_rate(samp_rate, 0)
+    # UHD may COERCE the requested rate to the nearest the B210 can synthesise;
+    # its docs direct callers to get_rx_rate() for the actual value. Building the
+    # bin width, hop spacing and frequency metadata from the requested rate while
+    # the device samples at another describes a different spectrum than captured,
+    # so read it back and rebuild the plan on the actual rate.
+    actual_rate = float(usrp.get_rx_rate(0))
+    if abs(actual_rate - samp_rate) > 1.0:
+        note(f"[sweep] UHD coerced sample rate {samp_rate/1e6:.6f}M -> "
+             f"{actual_rate/1e6:.6f}M; rebuilding the plan on the actual rate")
+        samp_rate, nfft, bin_hz, keep, centers, usable_bw = build_hop_plan(
+            args.start, args.stop, actual_rate, args.bin, args.crop)
+        if bins_in_range(centers, keep, bin_hz, args.start, args.stop) == 0:
+            raise SystemExit(
+                f"after rate coercion to {actual_rate/1e6:.6f}M no FFT bin falls within "
+                f"{args.start/1e6:.6f}-{args.stop/1e6:.6f} MHz — widen the range or lower --bin")
+        window = np.hanning(nfft)
+        wnorm = (window ** 2).sum()
     usrp.set_rx_gain(args.gain, 0)  # fixed for the run; hop_psd only retunes
     if args.stable_floor:
         # Stop the periodic re-convergence that wobbles the floor by ~1 dB.
@@ -201,7 +319,11 @@ def main():
     t_run0 = time.time()
     n_done = 0
     try:
-        while not _STOP:
+        # sweep_schedule owns the run's timing: a monotonic deadline it checks
+        # before each sweep, and an inter-sweep wait bounded by the time left in
+        # the run (so --duration is never overrun by a trailing --interval wait).
+        for _ in sweep_schedule(time, args.count, args.duration, args.interval,
+                                stop=lambda: _STOP):
             t0 = time.time()
             hop_db = []
             hop_clip = []
@@ -216,25 +338,30 @@ def main():
             if _STOP:
                 break
 
-            # rtl_power CSV: one line per hop.
+            # rtl_power CSV: one line per hop, on the true FFT bin grid and
+            # trimmed to [start, stop] so it matches the JSON stream exactly.
             if logf:
-                d, t = time.strftime("%Y-%m-%d, %H:%M:%S", time.localtime(t0)).split(", ")
+                d, t = csv_timestamp(t0)
                 for center, dbk in hop_db:
-                    low = center - usable_bw / 2.0
-                    high = center + usable_bw / 2.0
+                    fc = hop_bin_centers(center, len(dbk), bin_hz)
+                    m = (fc >= args.start) & (fc <= args.stop)
+                    if not m.any():
+                        continue
+                    fsel = fc[m]
+                    low = fsel[0] - bin_hz / 2.0     # bin edges = centre ± half a bin
+                    high = fsel[-1] + bin_hz / 2.0
                     row = [d, t, f"{low:.0f}", f"{high:.0f}", f"{bin_hz:.2f}",
                            str(args.frames * nfft)]
-                    row += [f"{v:.2f}" for v in dbk]
+                    row += [f"{v:.2f}" for v in dbk[m]]
                     logf.write(", ".join(row) + "\n")
 
             # JSONL stream: whole stitched sweep, trimmed to [start, stop].
             if args.stream:
-                freqs = np.concatenate([
-                    center + (np.arange(keep) - keep / 2.0 + 0.5) * bin_hz
-                    for center, _ in hop_db])
+                freqs = np.concatenate([hop_bin_centers(center, len(dbk), bin_hz)
+                                        for center, dbk in hop_db])
                 allbins = np.concatenate([dbk for _, dbk in hop_db])
                 m = (freqs >= args.start) & (freqs <= args.stop)
-                obj = {"t": round(t0, 3), "f0": float(freqs[m][0]),
+                obj = {"t": round(t0, 6), "f0": float(freqs[m][0]),
                        "f1": float(freqs[m][-1]), "bin": bin_hz,
                        "clip": round(max(hop_clip), 6) if hop_clip else 0.0,
                        "db": [round(float(v), 2) for v in allbins[m]]}
@@ -246,16 +373,6 @@ def main():
             n_done += 1
             note(f"[sweep] #{n_done} done in {time.time()-t0:.2f}s "
                  f"({len(centers)} hops)")
-
-            if args.count and n_done >= args.count:
-                break
-            if args.duration and (time.time() - t_run0) >= args.duration:
-                break
-            if args.interval:
-                slack = args.interval - (time.time() - t0)
-                while slack > 0 and not _STOP:
-                    time.sleep(min(slack, 0.2))
-                    slack = args.interval - (time.time() - t0)
     finally:
         if logf:
             logf.close()

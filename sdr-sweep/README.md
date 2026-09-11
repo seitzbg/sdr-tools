@@ -104,8 +104,11 @@ Every command takes `--help` and `--version`.
 ## Prometheus & Grafana
 
 `sdr-sweep-exporter` serves Prometheus metrics on `:9821/metrics`: noise floor,
-peak freq/level, active-bin count, per-band peak & occupancy, and a sweep
-counter. See [`examples/prometheus-scrape.yml`](examples/prometheus-scrape.yml)
+peak freq/level, per-sweep SNR (peak − that sweep's own floor), active-bin count,
+per-band peak & occupancy, and a sweep counter. Per-band series carry both a
+human `band="…MHz"` label and a stable `idx="N"` label, so distinct sub-bands of
+a narrow capture stay distinct series even when their rounded frequency text
+collides. See [`examples/prometheus-scrape.yml`](examples/prometheus-scrape.yml)
 for a scrape job and [`examples/sdr-sweep-exporter.service`](examples/sdr-sweep-exporter.service)
 for a systemd unit that runs the capture → exporter pipeline forever.
 
@@ -132,6 +135,7 @@ The `_max` / `_mean` series aggregate **every** sweep in a rolling `--window`
 |---|---|
 | `sdr_sweep_noise_floor_db` | `_mean`, `_max` |
 | `sdr_sweep_peak_db` | `sdr_sweep_peak_db_max`, `sdr_sweep_peak_freq_hz_at_max` |
+| `sdr_sweep_snr_db` | `sdr_sweep_snr_db_max` |
 | `sdr_sweep_active_bins` | `sdr_sweep_active_bins_max` |
 | `sdr_sweep_occupancy_ratio` | `_max`, `_mean` |
 | `sdr_sweep_clip_fraction` | `_max`, `_mean` |
@@ -142,6 +146,11 @@ Use the windowed series for anything event-like — **`sdr_sweep_clip_fraction_m
 is the one to alert on for ADC overload.** `sdr_sweep_window_sweeps` reports how
 many sweeps back the current aggregates; if it hits 0 on a live process, capture
 has wedged without closing the pipe.
+
+SNR is a **per-sweep** quantity (each sweep's peak minus that same sweep's own
+floor). Chart `sdr_sweep_snr_db_max`, not `peak_db_max − noise_floor_db_mean` —
+the latter subtracts one sweep's floor from another's peak and inflates SNR
+whenever the floor drifts.
 
 > The dashboard's "Instrument health" row (device-on-bus / USB link / host
 > temperature) is driven by an optional `node_exporter` textfile collector on the
@@ -168,6 +177,12 @@ sdr-sweep-gaincal --manage-service            # table + recommendation
 sdr-sweep-gaincal --manage-service --json | jq .recommended
 ```
 
+If **every** tested gain already clips (no clean operating point exists), there
+is no gain to recommend: the text output says so and `--json` reports
+`"recommended": null` with `"clean_gain_exists": false` — lower `--gain-start`,
+add external attenuation, or reduce the input, then re-run. `--manage-service`
+restarts the exporter on **every** exit path, including Ctrl-C during startup.
+
 Clip detection is bursty: a `clip = 0` reading only ever means "no overload seen
 in the observed time", which the tool prints. For a definitive answer, prefer
 the exporter's continuous `sdr_sweep_clip_fraction_max`, which watches every
@@ -176,6 +191,11 @@ sweep.
 ## Notes & caveats
 
 - **Uncalibrated dB.** Don't read the numbers as dBm; they're relative.
+- **CSV format.** rtl_power-style, with two extensions: the time field carries
+  sub-second precision (`HH:MM:SS.ffffff`) so fast sweeps keep their timing, and
+  rows are trimmed to `--start`/`--stop` (matching the JSON stream). `sdr-sweep-report`
+  still reads legacy whole-second logs, but rejects a file that appends captures
+  made with a *different* `--bin` — report one capture session per file.
 - **Antenna.** UHD offers only `TX/RX` and `RX2`; the board's silkscreen "RX1"
   connector is UHD `RX2` (the default `--ant`). RX only; never transmit.
 - **AD9361 floor ripple.** A ~1–2 dB periodic whole-band wobble is the chip's

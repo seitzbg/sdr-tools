@@ -11,6 +11,7 @@ about *changes* and *contrast*, not absolute dBm.
 """
 import argparse
 import sys
+import warnings
 from datetime import datetime
 
 import numpy as np
@@ -18,16 +19,31 @@ import numpy as np
 from sdr_sweep import __version__
 
 
+def _parse_epoch(d, t):
+    """Parse a CSV (date, time) pair. Accepts sub-second time (HH:MM:SS.ffffff,
+    written by the current capture engine) and legacy whole-second logs."""
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(f"{d} {t}", fmt).timestamp()
+        except ValueError:
+            continue
+    raise ValueError(f"unparseable timestamp {d!r} {t!r}")
+
+
 def load(path):
     """Parse an rtl_power-format CSV into (times, freqs, P[time, freq]) in dB.
 
     Sweeps are delimited by the hop frequency wrapping back down to the start;
     that's robust even when several hops share the same wall-clock second.
+
+    All rows must share one bin width (`step`): appending captures made with a
+    different --bin to the same file produces an incompatible grid, which is
+    rejected with an explanatory error rather than silently mis-binned.
     """
-    lows, highs, step = [], [], None
-    rows = []  # (epoch, low, np.array(db))
+    step = None
+    rows = []  # (epoch, low, high, st, db)
     with open(path) as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
                 continue
@@ -37,15 +53,18 @@ def load(path):
             d, t = parts[0], parts[1]
             low, high, st = float(parts[2]), float(parts[3]), float(parts[4])
             db = np.array([float(x) for x in parts[6:]], dtype=np.float64)
-            epoch = datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M:%S").timestamp()
-            rows.append((epoch, low, high, st, db))
-            lows.append(low)
-            highs.append(high)
-            step = st
+            if step is None:
+                step = st
+            elif abs(st - step) > max(1e-3, 1e-6 * step):
+                sys.exit(f"{path}:{lineno}: bin width changes mid-file ({st:g} vs {step:g} Hz). "
+                         "This file appends captures made with different --bin; the report "
+                         "cannot bin them onto one grid. Report one session per file.")
+            rows.append((_parse_epoch(d, t), low, high, st, db))
     if not rows:
         sys.exit(f"no data rows in {path}")
 
-    gmin, gmax = min(lows), max(highs)
+    gmin = min(r[1] for r in rows)
+    gmax = max(r[2] for r in rows)
     nbins = int(round((gmax - gmin) / step))
     freqs = gmin + (np.arange(nbins) + 0.5) * step
 
@@ -66,17 +85,58 @@ def load(path):
         times[si] = sw[0][0]
         for epoch, low, high, st, db in sw:
             i0 = int(round((low - gmin) / step))
-            P[si, i0:i0 + len(db)] = db
+            end = i0 + len(db)
+            if i0 < 0 or end > nbins:
+                sys.exit(f"{path}: a row at {low:.0f} Hz ({len(db)} bins) falls outside the "
+                         f"{gmin:.0f}-{gmax:.0f} Hz grid — misaligned or mixed capture geometry.")
+            P[si, i0:end] = db
     return times, freqs, P
+
+
+def _spectral_floor(vals, win, pct):
+    """Rolling low-percentile of `vals` across frequency.
+
+    Reads each bin's noise floor from its neighbourhood, so — unlike a temporal
+    percentile — it is not fooled by a signal present the whole time: a
+    persistent narrowband carrier's neighbours are noise, and this reaches under
+    it. NaN-aware; the window tracks slow floor slope across the band.
+    """
+    vals = np.asarray(vals, dtype=np.float64)
+    n = len(vals)
+    win = min(win, n)
+    if win % 2 == 0:
+        win -= 1
+    if win < 3:
+        return vals.copy()
+    pad = win // 2
+    padded = np.pad(vals, pad, mode="edge")
+    sw = np.lib.stride_tricks.sliding_window_view(padded, win)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN windows -> NaN
+        return np.nanpercentile(sw, pct, axis=1)
 
 
 def analyse(times, freqs, P, margin, floor_pct):
     """Return a dict of derived metrics used by both the report and the plot."""
-    # Per-bin baseline (quiet level) = low percentile across time. Robust to
-    # signals that are present only part of the time.
-    baseline = np.nanpercentile(P, floor_pct, axis=0)
+    valid = ~np.isnan(P)                            # which measurements exist
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        # Per-bin temporal quiet level = low percentile across time. Catches
+        # intermittent signals (which dip to noise between bursts) but a
+        # persistent carrier becomes its own baseline — hence the spectral floor.
+        temporal = np.nanpercentile(P, floor_pct, axis=0)
+    # Spectral noise floor read from each bin's frequency neighbourhood. The
+    # detection baseline is the LOWER of the two estimates: a signal only ever
+    # raises an estimate above the true floor, so the smaller one is the better
+    # floor. This detects steady carriers (temporal high, spectral low) and
+    # intermittent ones (both low) alike.
+    win = min(len(freqs), 65)
+    spectral = _spectral_floor(temporal, win, 25.0)
+    baseline = np.fmin(temporal, spectral)          # fmin ignores NaN
     thresh = baseline + margin                      # per-bin "active" threshold
-    active = P > thresh                             # bool [time, freq]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        active = valid & (P > thresh)               # NaN never counts as active
 
     # Overall noise floor per sweep = median across freq (signals don't move it).
     floor_t = np.nanmedian(P, axis=1)
@@ -85,12 +145,19 @@ def analyse(times, freqs, P, margin, floor_pct):
     k = max(1, n // 10)
     drift = float(np.nanmedian(floor_t[-k:]) - np.nanmedian(floor_t[:k]))
 
-    occupancy = np.nanmean(active, axis=0)          # fraction of time each bin active
+    # Occupancy = active / *observed*, per bin. Missing observations (NaN) are
+    # excluded from the denominator instead of counting as inactive; a bin never
+    # observed stays NaN rather than reading as 0% occupied.
+    valid_counts = valid.sum(axis=0)
+    active_counts = active.sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        occupancy = np.where(valid_counts > 0,
+                             active_counts / np.maximum(valid_counts, 1), np.nan)
 
     # Cluster contiguous active bins (occupancy above a floor) into emitters.
-    of_interest = occupancy > 0.01
+    of_interest = occupancy > 0.01                  # NaN -> False
     emitters = []
-    step = freqs[1] - freqs[0]
+    step = float(freqs[1] - freqs[0]) if len(freqs) > 1 else 0.0
     i = 0
     N = len(freqs)
     while i < N:
@@ -107,9 +174,11 @@ def analyse(times, freqs, P, margin, floor_pct):
         lo, hi = i, run_end
         sub = P[:, lo:hi + 1]
         sub_active = active[:, lo:hi + 1]
+        sub_valid = valid[:, lo:hi + 1]
         present = sub_active.any(axis=1)            # sweeps where this cluster fired
-        occ = float(present.mean())
-        peak = float(np.nanmax(sub))
+        observed = sub_valid.any(axis=1)            # sweeps where it was observed at all
+        occ = float(present.sum() / observed.sum()) if observed.any() else float("nan")
+        peak = float(np.nanmax(sub)) if sub_valid.any() else float("nan")
         # mean level while active
         act_vals = sub[sub_active]
         mean_active = float(np.nanmean(act_vals)) if act_vals.size else float("nan")
@@ -157,7 +226,9 @@ def write_report(out_path, src_name, times, freqs, P, a, margin, floor_pct):
     L.append(f"- **Drift over session: {drift:+.1f} dB — {arrow}**")
     if abs(drift) > 3:
         L.append(f"  - ⚠ floor moved {abs(drift):.1f} dB — check for creeping RFI / gain/AGC / thermal.")
-    band_occ = float((a["occupancy"] > 0.05).mean())
+    occ = a["occupancy"]
+    observed = ~np.isnan(occ)
+    band_occ = float((occ[observed] > 0.05).mean()) if observed.any() else 0.0
     L.append(f"- Band occupancy: {band_occ*100:.1f}% of bins active >5% of the time\n")
 
     L.append(f"## Emitters ({len(a['emitters'])} clusters)")

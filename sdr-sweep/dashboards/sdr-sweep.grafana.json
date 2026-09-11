@@ -1492,12 +1492,12 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sdr_sweep_peak_db_max - sdr_sweep_noise_floor_db_mean",
+          "expr": "sdr_sweep_snr_db_max",
           "legendFormat": "SNR (60s max)",
           "refId": "D"
         }
       ],
-      "description": "peak_db_max - peak_db has been running 61-65 dB: the latest-sweep peak understates the window's strongest signal by that much. The latest-sweep series is kept alongside the windowed one on purpose: _max/_mean only start at the 2026-07-22 exporter deploy, so dropping the original would blank this chart's earlier history."
+      "description": "peak_db_max - peak_db has been running 61-65 dB: the latest-sweep peak understates the window's strongest signal by that much. SNR (60s max) uses sdr_sweep_snr_db_max — the best single-sweep peak-minus-floor over the window — so it never subtracts one sweep's floor from another sweep's peak (the earlier peak_db_max - noise_floor_db_mean form did, inflating SNR whenever the floor drifted). The latest-sweep series is kept alongside the windowed one on purpose: _max/_mean/_snr only start at the 2026-07-22 exporter deploy, so dropping the original would blank this chart's earlier history."
     },
     {
       "id": 18,

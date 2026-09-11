@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sdr-sweep"
-version = "1.0.0"
+version = "1.0.1"
 description = "Wideband spectrum sweep, live TUI, Prometheus exporter, and Grafana dashboard for the USRP B210 (UHD)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,6 +31,7 @@ dependencies = ["numpy>=1.24"]
 analysis = ["matplotlib>=3.7"]  # sdr-sweep-report waterfall PNG
 tui = ["rich>=13.0"]            # sdr-sweep-tui live display
 all = ["matplotlib>=3.7", "rich>=13.0"]
+test = ["pytest>=7"]            # the tests need only numpy + pytest (no radio)
 
 [project.scripts]
 sdr-sweep = "sdr_sweep.sweep:main"
@@ -49,6 +50,9 @@ packages = ["src/sdr_sweep"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/src", "/dashboards", "/examples", "/docs", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
